@@ -5,6 +5,7 @@
 use futures_core::future::BoxFuture;
 use serde::{ser::Serializer, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sqlx::ConnectOptions;
 use sqlx::{
     error::BoxDynError,
     migrate::{
@@ -88,6 +89,23 @@ fn path_mapper(mut app_path: PathBuf, connection_string: &str) -> String {
     )
 }
 
+#[cfg(feature = "sqlite")]
+fn path_mapper_db(mut app_path: PathBuf, connection_string: &str) -> String {
+  app_path.push(
+      connection_string
+          .split_once(':')
+          .expect("Couldn't parse the connection string for DB!")
+          .1,
+  );
+
+  format!(
+      "{}",
+      app_path
+          .to_str()
+          .expect("Problem creating fully qualified path to Database file!")
+  )
+}
+
 #[derive(Default)]
 struct DbInstances(Mutex<HashMap<String, Pool<Db>>>);
 
@@ -153,7 +171,7 @@ async fn load<R: Runtime>(
     db: String,
 ) -> Result<String> {
     #[cfg(feature = "sqlite")]
-    let fqdb = path_mapper(app_path(&app), &db);
+    let fqdb = path_mapper_db(app_path(&app), &db);
     #[cfg(not(feature = "sqlite"))]
     let fqdb = db.clone();
 
@@ -163,7 +181,24 @@ async fn load<R: Runtime>(
     if !Db::database_exists(&fqdb).await.unwrap_or(false) {
         Db::create_database(&fqdb).await?;
     }
-    let pool = Pool::connect(&fqdb).await?;
+
+    println!("db: {}", fqdb);
+
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+      .filename(&fqdb)
+      .create_if_missing(true)
+      // .busy_timeout(Duration::from_millis(100))
+      .log_statements(log::LevelFilter::Trace)
+      .log_slow_statements(log::LevelFilter::Trace, std::time::Duration::from_secs(1))
+      .disable_statement_logging()
+      .foreign_keys(true)
+      .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental)
+      .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+      .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+
+    let pool = Pool::connect_with(opts).await?;
+
+    // let pool = Pool::connect(&fqdb).await?;
 
     if let Some(migrations) = migrations.0.lock().await.remove(&db) {
         let migrator = Migrator::new(migrations).await?;
